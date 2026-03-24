@@ -1,128 +1,199 @@
 <?php
 
+declare(strict_types=1);
+
 namespace app\controllers;
 
 use Yii;
-use yii\filters\AccessControl;
+use app\models\Link;
 use yii\web\Controller;
+use yii\web\NotFoundHttpException;
 use yii\web\Response;
 use yii\filters\VerbFilter;
-use app\models\LoginForm;
-use app\models\ContactForm;
+use yii\filters\AccessControl;
+use yii\helpers\Url;
+use chillerlan\QRCode\QRCode;
+use chillerlan\QRCode\QROptions;
+use chillerlan\QRCode\Output\QRImage;
+use chillerlan\QRCode\Common\EccLevel;
+use yii\filters\ContentNegotiator;
+use yii\web\BadRequestHttpException;
 
+/**
+ * Site controller handles main page and short link creation.
+ * 
+ * @package app\controllers
+ */
 class SiteController extends Controller
 {
     /**
+     * QR code configuration constants
+     */
+    private const QR_VERSION = 5;
+    private const QR_SCALE = 5;
+    private const QR_ECC_LEVEL = EccLevel::L;
+    
+    /**
      * {@inheritdoc}
      */
-    public function behaviors()
+    public function actions(): array
     {
         return [
+            'error' => [
+                'class' => 'yii\web\ErrorAction',
+            ],
+        ];
+    }
+
+    /**
+     * {@inheritdoc}
+     */
+    public function behaviors(): array
+    {
+        return [
+            'contentNegotiator' => [
+                'class' => ContentNegotiator::class,
+                'only' => ['create'],
+                'formats' => [
+                    'application/json' => Response::FORMAT_JSON,
+                ],
+            ],
             'access' => [
                 'class' => AccessControl::class,
-                'only' => ['logout'],
+                'only' => ['index', 'create'],
                 'rules' => [
                     [
-                        'actions' => ['logout'],
                         'allow' => true,
-                        'roles' => ['@'],
+                        'roles' => ['?', '@'],
                     ],
                 ],
             ],
             'verbs' => [
                 'class' => VerbFilter::class,
                 'actions' => [
-                    'logout' => ['post'],
+                    'create' => ['POST'],
                 ],
             ],
         ];
     }
 
     /**
-     * {@inheritdoc}
-     */
-    public function actions()
-    {
-        return [
-            'error' => [
-                'class' => 'yii\web\ErrorAction',
-            ],
-            'captcha' => [
-                'class' => 'yii\captcha\CaptchaAction',
-                'fixedVerifyCode' => YII_ENV_TEST ? 'testme' : null,
-            ],
-        ];
-    }
-
-    /**
-     * Displays homepage.
-     *
+     * Displays homepage with short link creation form.
+     * 
      * @return string
      */
-    public function actionIndex()
+    public function actionIndex(): string
     {
         return $this->render('index');
     }
 
     /**
-     * Login action.
-     *
-     * @return Response|string
+     * Creates a short link from provided URL.
+     * 
+     * @return array JSON response with link data
+     * @throws BadRequestHttpException if URL is not provided
      */
-    public function actionLogin()
+    public function actionCreate(): array
     {
-        if (!Yii::$app->user->isGuest) {
-            return $this->goHome();
+        $url = $this->getUrlFromRequest();
+        
+        if (empty($url)) {
+            throw new BadRequestHttpException('URL parameter is required');
         }
-
-        $model = new LoginForm();
-        if ($model->load(Yii::$app->request->post()) && $model->login()) {
-            return $this->goBack();
+        
+        $link = Link::findOrCreateByUrl($url);
+        
+        if ($link->hasErrors()) {
+            return $this->prepareErrorResponse($link);
         }
-
-        $model->password = '';
-        return $this->render('login', [
-            'model' => $model,
-        ]);
+        
+        return $this->prepareSuccessResponse($link);
     }
 
     /**
-     * Logout action.
-     *
-     * @return Response
+     * Prepares successful response with link data.
+     * 
+     * @param Link $link
+     * @return array
      */
-    public function actionLogout()
+    private function prepareSuccessResponse(Link $link): array
     {
-        Yii::$app->user->logout();
-
-        return $this->goHome();
+        return [
+            'success' => true,
+            'short_url' => $this->getShortUrl($link->short_code),
+            'short_code' => $link->short_code,
+            'qr_code' => $this->generateQrCodeBase64($link->short_code),
+            'original_url' => $link->url,
+            'clicks' => $link->clicks,
+        ];
     }
 
     /**
-     * Displays contact page.
-     *
-     * @return Response|string
+     * Prepares error response with validation messages.
+     * 
+     * @param Link $link
+     * @return array
      */
-    public function actionContact()
+    private function prepareErrorResponse(Link $link): array
     {
-        $model = new ContactForm();
-        if ($model->load(Yii::$app->request->post()) && $model->contact(Yii::$app->params['adminEmail'])) {
-            Yii::$app->session->setFlash('contactFormSubmitted');
+        $errors = $link->getFirstErrors();
+        $firstError = reset($errors);
+        
+        return [
+            'success' => false,
+            'message' => $firstError ?: 'Unknown error occurred',
+            'errors' => $errors,
+        ];
+    }
 
-            return $this->refresh();
+    /**
+     * Generates QR code for short link in base64 format.
+     * 
+     * @param string $code Short link code
+     * @return string|null QR code as base64 or null on failure
+     */
+    private function generateQrCodeBase64(string $code): ?string
+    {
+        try {
+            $url = $this->getShortUrl($code);
+            
+            $options = new QROptions([
+                'version' => self::QR_VERSION,
+                'outputType' => QRImage::class,
+                'eccLevel' => self::QR_ECC_LEVEL,
+                'scale' => self::QR_SCALE,
+                'imageBase64' => true,
+                'quietzone' => true,
+                'addQuietzone' => true,
+            ]);
+            
+            $qrCode = new QRCode($options);
+            
+            return $qrCode->render($url);
+        } catch (\Throwable $e) {
+            Yii::error("QR code generation failed: {$e->getMessage()}", __METHOD__);
+            return null;
         }
-        return $this->render('contact', [
-            'model' => $model,
-        ]);
     }
 
     /**
-     * Displays about page.
-     *
+     * Gets short URL by code.
+     * 
+     * @param string $code
      * @return string
      */
-    public function actionAbout()
+    private function getShortUrl(string $code): string
     {
-        return $this->render('about');
+        return Url::to(['/go/' . $code], true);
+    }
+    
+    /**
+     * Extracts URL from request.
+     * 
+     * @return string|null
+     */
+    private function getUrlFromRequest(): ?string
+    {
+        return Yii::$app->request->post('url');
     }
 }
